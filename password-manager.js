@@ -1,124 +1,263 @@
 "use strict";
 
-/********* External Imports ********/
-
 const { stringToBuffer, bufferToString, encodeBuffer, decodeBuffer, getRandomBytes } = require("./lib");
 const { subtle } = require('crypto').webcrypto;
 
-/********* Constants ********/
+const PBKDF2_ITERATIONS = 100000;
+const MAX_PASSWORD_LENGTH = 64;
 
-const PBKDF2_ITERATIONS = 100000; // number of iterations for PBKDF2 algorithm
-const MAX_PASSWORD_LENGTH = 64;   // we can assume no password is longer than this many characters
-
-/********* Implementation ********/
 class Keychain {
-  /**
-   * Initializes the keychain using the provided information. Note that external
-   * users should likely never invoke the constructor directly and instead use
-   * either Keychain.init or Keychain.load. 
-   * Arguments:
-   *  You may design the constructor with any parameters you would like. 
-   * Return Type: void
-   */
-  constructor() {
-    this.data = { 
-      /* Store member variables that you intend to be public here
-         (i.e. information that will not compromise security if an adversary sees) */
+  constructor(masterKey, salt, hmacKey, encKey, kvs = {}) {
+    this.data = {
+      salt: salt,  // Salt for PBKDF2
+      kvs: kvs     // Key-value store for encrypted passwords
     };
+    
     this.secrets = {
-      /* Store member variables that you intend to be private here
-         (information that an adversary should NOT see). */
+      masterKey: masterKey,
+      hmacKey: hmacKey,
+      encKey: encKey
     };
-
-    throw "Not Implemented!";
-  };
-
-  /** 
-    * Creates an empty keychain with the given password.
-    *
-    * Arguments:
-    *   password: string
-    * Return Type: void
-    */
-  static async init(password) {
-    throw "Not Implemented!";
   }
 
-  /**
-    * Loads the keychain state from the provided representation (repr). The
-    * repr variable will contain a JSON encoded serialization of the contents
-    * of the KVS (as returned by the dump function). The trustedDataCheck
-    * is an *optional* SHA-256 checksum that can be used to validate the 
-    * integrity of the contents of the KVS. If the checksum is provided and the
-    * integrity check fails, an exception should be thrown. You can assume that
-    * the representation passed to load is well-formed (i.e., it will be
-    * a valid JSON object).Returns a Keychain object that contains the data
-    * from repr. 
-    *
-    * Arguments:
-    *   password:           string
-    *   repr:               string
-    *   trustedDataCheck: string
-    * Return Type: Keychain
-    */
-  static async load(password, repr, trustedDataCheck) {
-    throw "Not Implemented!";
-  };
+  static async init(password) {
+    const salt = getRandomBytes(16);
+    // Generate a verification hash during initialization
+    const verificationKey = getRandomBytes(32);
+    
+    const masterKey = await subtle.importKey(
+      "raw",
+      stringToBuffer(password),
+      "PBKDF2",
+      false,
+      ["deriveKey"]
+    );
 
-  /**
-    * Returns a JSON serialization of the contents of the keychain that can be 
-    * loaded back using the load function. The return value should consist of
-    * an array of two strings:
-    *   arr[0] = JSON encoding of password manager
-    *   arr[1] = SHA-256 checksum (as a string)
-    * As discussed in the handout, the first element of the array should contain
-    * all of the data in the password manager. The second element is a SHA-256
-    * checksum computed over the password manager to preserve integrity.
-    *
-    * Return Type: array
-    */ 
+    const derivedKey = await subtle.deriveKey(
+      {
+        name: "PBKDF2",
+        salt: salt,
+        iterations: PBKDF2_ITERATIONS,
+        hash: "SHA-256"
+      },
+      masterKey,
+      { name: "HMAC", hash: "SHA-256", length: 256 },
+      true,
+      ["sign", "verify"]
+    );
+
+    const keyMaterial = await subtle.exportKey("raw", derivedKey);
+
+    const hmacKey = await subtle.importKey(
+      "raw",
+      keyMaterial,
+      { name: "HMAC", hash: "SHA-256" },
+      false,
+      ["sign", "verify"]
+    );
+
+    const encKey = await subtle.importKey(
+      "raw",
+      keyMaterial,
+      "AES-GCM",
+      false,
+      ["encrypt", "decrypt"]
+    );
+
+    // Encrypt the verification key with the derived key
+    const iv = getRandomBytes(12);
+    const verificationData = await subtle.encrypt(
+      {
+        name: "AES-GCM",
+        iv: iv
+      },
+      encKey,
+      verificationKey
+    );
+
+    const keychain = new Keychain(masterKey, salt, hmacKey, encKey);
+    // Store verification data in the keychain
+    keychain.data.verification = {
+      data: encodeBuffer(verificationData),
+      iv: encodeBuffer(iv)
+    };
+
+    return keychain;
+  }
+
+static async load(password, repr, trustedDataCheck) {
+    const data = JSON.parse(repr);
+
+    // Verify data integrity if checksum provided
+    if (trustedDataCheck !== undefined) {
+        const hash = await subtle.digest("SHA-256", stringToBuffer(repr));
+        const hashString = encodeBuffer(hash);
+        if (hashString !== trustedDataCheck) {
+            throw new Error("Data integrity check failed");
+        }
+    }
+
+    // Ensure salt is in the correct format
+    let salt;
+    if (typeof data.salt === 'string') {
+        salt = decodeBuffer(data.salt);
+    } else if (data.salt instanceof Uint8Array || Buffer.isBuffer(data.salt)) {
+        salt = data.salt;
+    } else {
+        throw new Error("Invalid salt format");
+    }
+
+    // Recreate the master key from the password
+    const masterKey = await subtle.importKey(
+        "raw", 
+        stringToBuffer(password),
+        "PBKDF2",
+        false,
+        ["deriveKey"]
+    );
+
+    try {
+        // Derive key material using stored salt
+        const derivedKey = await subtle.deriveKey(
+            {
+                name: "PBKDF2",
+                salt: salt,
+                iterations: PBKDF2_ITERATIONS,
+                hash: "SHA-256"
+            },
+            masterKey,
+            { name: "HMAC", hash: "SHA-256", length: 256 },
+            true,
+            ["sign", "verify"]
+        );
+
+        const keyMaterial = await subtle.exportKey("raw", derivedKey);
+
+        // Create HMAC key and encryption key
+        const hmacKey = await subtle.importKey(
+            "raw",
+            keyMaterial,
+            { name: "HMAC", hash: "SHA-256" },
+            false,
+            ["sign", "verify"]
+        );
+
+        const encKey = await subtle.importKey(
+            "raw",
+            keyMaterial,
+            "AES-GCM",
+            false,
+            ["encrypt", "decrypt"]
+        );
+
+        // Verify the password using the verification data
+        if (data.verification) {
+            try {
+                await subtle.decrypt(
+                    {
+                        name: "AES-GCM",
+                        iv: decodeBuffer(data.verification.iv)
+                    },
+                    encKey,
+                    decodeBuffer(data.verification.data)
+                );
+                // If decryption succeeds, password is correct - create new keychain
+                return new Keychain(masterKey, salt, hmacKey, encKey, data.kvs);
+            } catch (error) {
+                // If decryption fails, the password is incorrect
+                throw new Error("Incorrect password");
+            }
+        } else {
+            throw new Error("No verification data available");
+        }
+    } catch (error) {
+        // Propagate the specific error or throw a generic one
+        if (error.message === "Incorrect password" || error.message === "No verification data available") {
+            throw error;
+        }
+        throw new Error("Failed to load keychain");
+    }
+}
+
+
   async dump() {
-    throw "Not Implemented!";
-  };
+    const repr = JSON.stringify({
+      ...this.data,
+      salt: encodeBuffer(this.data.salt)
+    });
+    const hash = await subtle.digest("SHA-256", stringToBuffer(repr));
+    return [repr, encodeBuffer(hash)];
+  }
 
-  /**
-    * Fetches the data (as a string) corresponding to the given domain from the KVS.
-    * If there is no entry in the KVS that matches the given domain, then return
-    * null.
-    *
-    * Arguments:
-    *   name: string
-    * Return Type: Promise<string>
-    */
-  async get(name) {
-    throw "Not Implemented!";
-  };
+  async _hmacDomain(domain) {
+    const hmac = await subtle.sign(
+      { name: "HMAC", hash: "SHA-256" },
+      this.secrets.hmacKey,
+      stringToBuffer(domain)
+    );
+    return encodeBuffer(hmac);
+  }
 
-  /** 
-  * Inserts the domain and associated data into the KVS. If the domain is
-  * already in the password manager, this method should update its value. If
-  * not, create a new entry in the password manager.
-  *
-  * Arguments:
-  *   name: string
-  *   value: string
-  * Return Type: void
-  */
-  async set(name, value) {
-    throw "Not Implemented!";
-  };
+  async get(domain) {
+    const domainHmac = await this._hmacDomain(domain);
+    const encrypted = this.data.kvs[domainHmac];
+    if (!encrypted) {
+      return null;
+    }
 
-  /**
-    * Removes the record with name from the password manager. Returns true
-    * if the record with the specified name is removed, false otherwise.
-    *
-    * Arguments:
-    *   name: string
-    * Return Type: Promise<boolean>
-  */
-  async remove(name) {
-    throw "Not Implemented!";
-  };
-};
+    try {
+      const { ciphertext, iv, associatedData } = JSON.parse(encrypted);
 
-module.exports = { Keychain }
+      if (associatedData !== domainHmac) {
+        throw "Swap attack detected";
+      }
+
+      const decrypted = await subtle.decrypt(
+        {
+          name: "AES-GCM",
+          iv: decodeBuffer(iv),
+          additionalData: stringToBuffer(associatedData)
+        },
+        this.secrets.encKey,
+        decodeBuffer(ciphertext)
+      );
+
+      return bufferToString(decrypted).replace(/\0+$/, '');
+    } catch (e) {
+      throw "Decryption failed or tampering detected";
+    }
+  }
+
+  async set(domain, password) {
+    const paddedPassword = password.padEnd(MAX_PASSWORD_LENGTH, '\0');
+    const domainHmac = await this._hmacDomain(domain);
+    const iv = getRandomBytes(12);
+
+    const ciphertext = await subtle.encrypt(
+      {
+        name: "AES-GCM",
+        iv: iv,
+        additionalData: stringToBuffer(domainHmac)
+      },
+      this.secrets.encKey,
+      stringToBuffer(paddedPassword)
+    );
+
+    this.data.kvs[domainHmac] = JSON.stringify({
+      ciphertext: encodeBuffer(ciphertext),
+      iv: encodeBuffer(iv),
+      associatedData: domainHmac
+    });
+  }
+
+  async remove(domain) {
+    const domainHmac = await this._hmacDomain(domain);
+    if (this.data.kvs[domainHmac]) {
+      delete this.data.kvs[domainHmac];
+      return true;
+    }
+    return false;
+  }
+}
+
+module.exports = { Keychain };
